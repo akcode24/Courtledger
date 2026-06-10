@@ -1,0 +1,6 @@
+{
+  "name": "CourtLedger",
+  "description": "Expense and attendance tracker for sports groups with automatic cost splitting",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
