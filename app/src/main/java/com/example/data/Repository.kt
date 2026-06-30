@@ -8,7 +8,9 @@ class Repository(
     private val sessionDao: SessionDao,
     private val expenseItemDao: ExpenseItemDao,
     private val attendanceDao: AttendanceDao,
-    private val paymentDao: PaymentDao
+    private val paymentDao: PaymentDao,
+    private val bulkExpenseDao: BulkExpenseDao,
+    private val bankTransactionDao: BankTransactionDao
 ) {
     // Groups
     val allGroups: Flow<List<Group>> = groupDao.getAllGroups()
@@ -99,4 +101,18 @@ class Repository(
     suspend fun insertPayment(payment: Payment): Long = paymentDao.insert(payment)
 
     suspend fun deletePayment(payment: Payment) = paymentDao.delete(payment)
+
+    // Bulk Expenses
+    fun getBulkExpensesForGroup(groupId: Int): Flow<List<BulkExpense>> = bulkExpenseDao.getBulkExpensesForGroup(groupId)
+
+    suspend fun insertBulkExpense(bulkExpense: BulkExpense): Long = bulkExpenseDao.insert(bulkExpense)
+
+    suspend fun deleteBulkExpense(bulkExpense: BulkExpense) = bulkExpenseDao.delete(bulkExpense)
+
+    // Bank Transactions
+    fun getBankTransactionsForGroup(groupId: Int): Flow<List<BankTransaction>> = bankTransactionDao.getBankTransactionsForGroup(groupId)
+
+    suspend fun insertBankTransaction(transaction: BankTransaction): Long = bankTransactionDao.insert(transaction)
+
+    suspend fun deleteBankTransaction(transaction: BankTransaction) = bankTransactionDao.delete(transaction)
 }

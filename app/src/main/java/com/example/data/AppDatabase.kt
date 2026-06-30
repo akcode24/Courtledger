@@ -12,9 +12,11 @@ import androidx.room.RoomDatabase
         Session::class,
         ExpenseItem::class,
         Attendance::class,
-        Payment::class
+        Payment::class,
+        BulkExpense::class,
+        BankTransaction::class
     ],
-    version = 1,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -24,6 +26,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun expenseItemDao(): ExpenseItemDao
     abstract fun attendanceDao(): AttendanceDao
     abstract fun paymentDao(): PaymentDao
+    abstract fun bulkExpenseDao(): BulkExpenseDao
+    abstract fun bankTransactionDao(): BankTransactionDao
 
     companion object {
         @Volatile

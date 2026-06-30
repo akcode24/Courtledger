@@ -28,7 +28,8 @@ data class Session(
     val groupId: Int,
     val dateMillis: Long,
     val notes: String = "",
-    val totalCost: Double = 0.0
+    val totalCost: Double = 0.0,
+    val isPaidFromBank: Boolean = false
 )
 
 @Entity(tableName = "expense_items")
@@ -57,3 +58,27 @@ data class Payment(
     val dateMillis: Long,
     val notes: String = ""
 )
+
+@Entity(tableName = "bulk_expenses")
+data class BulkExpense(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val groupId: Int,
+    val title: String,
+    val amount: Double,
+    val paidByMemberId: Int, // The member who bought/funded the items
+    val dateMillis: Long = System.currentTimeMillis(),
+    val notes: String = "",
+    val isPaidFromBank: Boolean = false
+)
+
+@Entity(tableName = "bank_transactions")
+data class BankTransaction(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val groupId: Int,
+    val dateMillis: Long = System.currentTimeMillis(),
+    val description: String,
+    val amount: Double, // positive details deposit, negative details deduction
+    val memberId: Int? = null,
+    val isSystemOverpayment: Boolean = false
+)
+

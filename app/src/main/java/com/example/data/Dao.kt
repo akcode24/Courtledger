@@ -19,6 +19,15 @@ interface GroupDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(group: Group): Long
 
+    @Query("SELECT * FROM groups")
+    suspend fun getAllGroupsSync(): List<Group>
+
+    @Query("DELETE FROM groups")
+    suspend fun deleteAllGroups()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(groups: List<Group>)
+
     @Update
     suspend fun update(group: Group)
 
@@ -33,6 +42,15 @@ interface MemberDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(member: Member): Long
+
+    @Query("SELECT * FROM members")
+    suspend fun getAllMembers(): List<Member>
+
+    @Query("DELETE FROM members")
+    suspend fun deleteAllMembers()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(members: List<Member>)
 
     @Update
     suspend fun update(member: Member)
@@ -58,6 +76,15 @@ interface SessionDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(session: Session): Long
 
+    @Query("SELECT * FROM sessions")
+    suspend fun getAllSessions(): List<Session>
+
+    @Query("DELETE FROM sessions")
+    suspend fun deleteAllSessions()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(sessions: List<Session>)
+
     @Update
     suspend fun update(session: Session)
 
@@ -75,6 +102,12 @@ interface ExpenseItemDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(expenseItem: ExpenseItem): Long
+
+    @Query("SELECT * FROM expense_items")
+    suspend fun getAllExpenseItems(): List<ExpenseItem>
+
+    @Query("DELETE FROM expense_items")
+    suspend fun deleteAllExpenseItems()
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(items: List<ExpenseItem>)
@@ -97,6 +130,12 @@ interface AttendanceDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(attendance: Attendance): Long
 
+    @Query("SELECT * FROM attendance")
+    suspend fun getAllAttendance(): List<Attendance>
+
+    @Query("DELETE FROM attendance")
+    suspend fun deleteAllAttendance()
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(attendances: List<Attendance>)
 
@@ -115,6 +154,57 @@ interface PaymentDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(payment: Payment): Long
 
+    @Query("SELECT * FROM payments")
+    suspend fun getAllPayments(): List<Payment>
+
+    @Query("DELETE FROM payments")
+    suspend fun deleteAllPayments()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(payments: List<Payment>)
+
     @Delete
     suspend fun delete(payment: Payment)
+}
+
+@Dao
+interface BulkExpenseDao {
+    @Query("SELECT * FROM bulk_expenses WHERE groupId = :groupId ORDER BY dateMillis DESC")
+    fun getBulkExpensesForGroup(groupId: Int): Flow<List<BulkExpense>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(bulkExpense: BulkExpense): Long
+
+    @Query("SELECT * FROM bulk_expenses")
+    suspend fun getAllBulkExpenses(): List<BulkExpense>
+
+    @Query("DELETE FROM bulk_expenses")
+    suspend fun deleteAllBulkExpenses()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(bulkExpenses: List<BulkExpense>)
+
+    @Delete
+    suspend fun delete(bulkExpense: BulkExpense)
+}
+
+@Dao
+interface BankTransactionDao {
+    @Query("SELECT * FROM bank_transactions WHERE groupId = :groupId ORDER BY dateMillis DESC")
+    fun getBankTransactionsForGroup(groupId: Int): Flow<List<BankTransaction>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(transaction: BankTransaction): Long
+
+    @Query("SELECT * FROM bank_transactions")
+    suspend fun getAllBankTransactions(): List<BankTransaction>
+
+    @Query("DELETE FROM bank_transactions")
+    suspend fun deleteAllBankTransactions()
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(transactions: List<BankTransaction>)
+
+    @Delete
+    suspend fun delete(transaction: BankTransaction)
 }

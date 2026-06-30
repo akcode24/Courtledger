@@ -3,6 +3,7 @@ package com.example.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.room.withTransaction
 import com.example.data.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -28,7 +29,17 @@ data class GroupDashboardState(
     val payments: List<Payment> = emptyList(),
     val balances: List<MemberBalance> = emptyList(),
     val sessionDetails: List<SessionSplitDetail> = emptyList(),
-    val currentUser: Member? = null
+    val currentUser: Member? = null,
+    val bulkExpenses: List<BulkExpense> = emptyList(),
+    val bankTransactions: List<BankTransaction> = emptyList(),
+    val bankBalance: Double = 0.0
+)
+
+data class GroupStateInfo(
+    val group: Group?,
+    val members: List<Member>,
+    val sessions: List<Session>,
+    val bulkExpenses: List<BulkExpense>
 )
 
 class CourtLedgerViewModel(application: Application) : AndroidViewModel(application) {
@@ -39,7 +50,9 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
         database.sessionDao(),
         database.expenseItemDao(),
         database.attendanceDao(),
-        database.paymentDao()
+        database.paymentDao(),
+        database.bulkExpenseDao(),
+        database.bankTransactionDao()
     )
 
     // All available groups
@@ -49,6 +62,16 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
     // Currently selected group ID
     private val _selectedGroupId = MutableStateFlow<Int?>(null)
     val selectedGroupId: StateFlow<Int?> = _selectedGroupId.asStateFlow()
+
+    // Theme Mode Preference persistence
+    private val sharedPrefs = application.getSharedPreferences("courtledger_prefs", android.content.Context.MODE_PRIVATE)
+    private val _themeMode = MutableStateFlow(sharedPrefs.getString("theme_mode", "system") ?: "system")
+    val themeMode: StateFlow<String> = _themeMode.asStateFlow()
+
+    fun setThemeMode(mode: String) {
+        sharedPrefs.edit().putString("theme_mode", mode).apply()
+        _themeMode.value = mode
+    }
 
     // Email logs simulation list
     private val _emailLogs = MutableStateFlow<List<String>>(emptyList())
@@ -66,24 +89,29 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                 val expensesFlow = repository.getExpensesForGroup(groupId)
                 val attendanceFlow = repository.getAttendanceForGroup(groupId)
                 val paymentsFlow = repository.getPaymentsForGroup(groupId)
+                val bulkExpensesFlow = repository.getBulkExpensesForGroup(groupId)
+                val bankFlow = repository.getBankTransactionsForGroup(groupId)
 
                 val groupDetailsFlow = combine(
                     groupFlow,
                     membersFlow,
-                    sessionsFlow
-                ) { group, members, sessions ->
-                    Triple(group, members, sessions)
+                    sessionsFlow,
+                    bulkExpensesFlow
+                ) { group, members, sessions, bulk ->
+                    GroupStateInfo(group, members, sessions, bulk)
                 }
 
                 combine(
                     groupDetailsFlow,
                     expensesFlow,
                     attendanceFlow,
-                    paymentsFlow
-                ) { details, expenses, attendances, payments ->
-                    val group = details.first
-                    val members = details.second
-                    val sessions = details.third
+                    paymentsFlow,
+                    bankFlow
+                ) { details, expenses, attendances, payments, bankTrans ->
+                    val group = details.group
+                    val members = details.members
+                    val sessions = details.sessions
+                    val bulkExpenses = details.bulkExpenses
 
                     if (group == null) return@combine GroupDashboardState()
 
@@ -97,7 +125,7 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                         val presentAttendance = sessionAttendance.filter { it.isPresent }
 
                         val splitMap = mutableMapOf<Int, Double>()
-                        if (presentAttendance.isNotEmpty()) {
+                        if (!session.isPaidFromBank && presentAttendance.isNotEmpty()) {
                             val presentWithOverride = presentAttendance.filter { it.costOverride != null }
                             val totalOverrides = presentWithOverride.sumOf { it.costOverride ?: 0.0 }
                             val noOverrideCount = presentAttendance.size - presentWithOverride.size
@@ -123,16 +151,49 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                         )
                     }
 
+                    // Identify regular members (to split bulk expenses)
+                    val regularMembers = members.filter { it.role == "Admin" || it.role == "Member" }
+                    val regularCount = regularMembers.size.coerceAtLeast(1)
+
                     // 2. Accumulate member overall balances
+                    val primaryAdmin = members.find { it.role == "Admin" } ?: members.find { it.isCurrentUser } ?: members.firstOrNull()
+                    val totalNonBankSessionsCost = sessionDetails.sumOf { if (!it.session.isPaidFromBank) it.expenseItems.sumOf { e -> e.amount } else 0.0 }
+                    val totalOtherPayments = if (primaryAdmin != null) {
+                        payments.filter { it.memberId != primaryAdmin.id }.sumOf { it.amount }
+                    } else {
+                        0.0
+                    }
+
                     val balances = members.map { member ->
-                        // Calculate total split cost accrued from sessions
+                        // Calculate total split cost accrued from sessions (excluding bank paid sessions!)
                         var costShare = 0.0
                         for (sDetail in sessionDetails) {
-                            costShare += sDetail.splits[member.id] ?: 0.0
+                            if (!sDetail.session.isPaidFromBank) {
+                                costShare += sDetail.splits[member.id] ?: 0.0
+                            }
                         }
 
-                        // Calculate total payments made
-                        val paid = payments.filter { it.memberId == member.id }.sumOf { it.amount }
+                        // Add block/bulk expenses if member is a regular user (Admin or Member, and not group-funded)
+                        val isRegular = member.role == "Admin" || member.role == "Member"
+                        if (isRegular) {
+                            for (be in bulkExpenses) {
+                                if (!be.isPaidFromBank) {
+                                    costShare += be.amount / regularCount
+                                }
+                            }
+                        }
+
+                        // Calculate total payments made (including any bulk purchases they bought/funded!)
+                        var paid = payments.filter { it.memberId == member.id }.sumOf { it.amount }
+                        // Only count bulk purchases paid by member if not funded directly from bank resource. Ignore negative bulk expenses (reductions).
+                        val paidBulk = bulkExpenses.filter { it.paidByMemberId == member.id && !it.isPaidFromBank && it.amount > 0.0 }.sumOf { it.amount }
+                        paid += paidBulk
+
+                        if (primaryAdmin != null && member.id == primaryAdmin.id) {
+                            // Admin is credited with paying all non-bank session costs, and debited with payments made by others to them
+                            paid += totalNonBankSessionsCost
+                            paid -= totalOtherPayments
+                        }
 
                         MemberBalance(
                             member = member,
@@ -142,6 +203,8 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                         )
                     }
 
+                    val calculatedBankBalance = bankTrans.sumOf { it.amount }
+
                     GroupDashboardState(
                         group = group,
                         members = members,
@@ -149,7 +212,10 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                         payments = payments,
                         balances = balances,
                         sessionDetails = sessionDetails,
-                        currentUser = currentUser
+                        currentUser = currentUser,
+                        bulkExpenses = bulkExpenses,
+                        bankTransactions = bankTrans,
+                        bankBalance = calculatedBankBalance
                     )
                 }
             }
@@ -179,11 +245,25 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
         val bob = Member(groupId = g1Id, name = "Bob Lim", role = "Member", email = "bob@example.com")
         val charlie = Member(groupId = g1Id, name = "Charlie Ng", role = "Member", email = "charlie@example.com")
         val diana = Member(groupId = g1Id, name = "Diana Wong", role = "Member", email = "diana@example.com")
+        val ethan = Member(groupId = g1Id, name = "Ethan Guest", role = "One-time Player", email = "ethan@example.com") // Guest player
 
         val aliceId = repository.insertMember(alice).toInt()
         val bobId = repository.insertMember(bob).toInt()
         val charlieId = repository.insertMember(charlie).toInt()
         val dianaId = repository.insertMember(diana).toInt()
+        val ethanId = repository.insertMember(ethan).toInt()
+
+        // Insert Bulk Expense for Group 1: $120.00 split among 4 regular members (Alice, Bob, Charlie, Diana) only (excluding Ethan)
+        repository.insertBulkExpense(
+            BulkExpense(
+                groupId = g1Id,
+                title = "10x Aerosonic Shuttlecock Tubes",
+                amount = 120.0,
+                paidByMemberId = aliceId,
+                dateMillis = System.currentTimeMillis() - 5 * 24 * 3600 * 1000L,
+                notes = "Bulk bought for regular members"
+            )
+        )
 
         // Session 1: Early June Court Playing
         // Court rentals: $40, shuttlecocks: $16. Total = $56
@@ -198,7 +278,8 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                 Attendance(sessionId = 0, memberId = aliceId, isPresent = true),
                 Attendance(sessionId = 0, memberId = bobId, isPresent = true),
                 Attendance(sessionId = 0, memberId = charlieId, isPresent = true),
-                Attendance(sessionId = 0, memberId = dianaId, isPresent = false)
+                Attendance(sessionId = 0, memberId = dianaId, isPresent = false),
+                Attendance(sessionId = 0, memberId = ethanId, isPresent = false)
             )
         )
 
@@ -216,7 +297,8 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
                 Attendance(sessionId = 0, memberId = aliceId, isPresent = true),
                 Attendance(sessionId = 0, memberId = bobId, isPresent = true),
                 Attendance(sessionId = 0, memberId = charlieId, isPresent = true, costOverride = 10.0),
-                Attendance(sessionId = 0, memberId = dianaId, isPresent = true)
+                Attendance(sessionId = 0, memberId = dianaId, isPresent = true),
+                Attendance(sessionId = 0, memberId = ethanId, isPresent = true) // Ethan attended this session
             )
         )
 
@@ -279,12 +361,24 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    fun updateGroup(group: Group) {
+        viewModelScope.launch {
+            repository.insertGroup(group)
+        }
+    }
+
     fun addMember(name: String, role: String, email: String) {
         val groupId = _selectedGroupId.value ?: return
         viewModelScope.launch {
             repository.insertMember(
                 Member(groupId = groupId, name = name, role = role, email = email)
             )
+        }
+    }
+
+    fun updateMember(member: Member) {
+        viewModelScope.launch {
+            repository.updateMember(member)
         }
     }
 
@@ -299,36 +393,173 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
         notes: String,
         dateMillis: Long,
         expenses: List<ExpenseItem>,
-        attendanceList: List<Attendance>
+        attendanceList: List<Attendance>,
+        isPaidFromBank: Boolean = false
     ) {
         val groupId = _selectedGroupId.value ?: return
         viewModelScope.launch {
-            repository.insertSessionWithDetails(
-                Session(groupId = groupId, dateMillis = dateMillis, notes = notes, totalCost = 0.0),
+            val totalCost = expenses.sumOf { it.amount }
+            val sessionId = repository.insertSessionWithDetails(
+                Session(groupId = groupId, dateMillis = dateMillis, notes = notes, totalCost = 0.0, isPaidFromBank = isPaidFromBank),
                 expenses,
                 attendanceList
             )
+            if (isPaidFromBank && totalCost > 0.0) {
+                repository.insertBankTransaction(
+                    BankTransaction(
+                        groupId = groupId,
+                        dateMillis = dateMillis,
+                        description = "Session Fee: $notes",
+                        amount = -totalCost
+                    )
+                )
+            }
         }
     }
 
     fun deleteSession(session: Session) {
         viewModelScope.launch {
             repository.deleteSession(session)
+            if (session.isPaidFromBank) {
+                val groupTransactions = repository.getBankTransactionsForGroup(session.groupId).firstOrNull() ?: emptyList()
+                val targetStr = "Session Fee: ${session.notes}"
+                val matched = groupTransactions.find {
+                    it.amount < 0.0 && (it.description == targetStr || Math.abs(it.amount - (-session.totalCost)) < 0.01)
+                }
+                if (matched != null) {
+                    repository.deleteBankTransaction(matched)
+                }
+            }
         }
     }
 
     fun addPayment(memberId: Int, amount: Double, notes: String) {
+        addGuestPaymentWithReduction(memberId, amount, notes, isDeduction = false)
+    }
+
+    fun addGuestPaymentWithReduction(memberId: Int, amount: Double, notes: String, isDeduction: Boolean) {
         val groupId = _selectedGroupId.value ?: return
         viewModelScope.launch {
+            // Check current outstanding balance to see if they are overpaying
+            val currentState = dashboardState.value
+            val bal = currentState.balances.find { it.member.id == memberId }
+            val currentOwed = bal?.outstandingBalance ?: 0.0
+            val memberName = bal?.member?.name ?: "Guest Player"
+
             repository.insertPayment(
-                Payment(groupId = groupId, memberId = memberId, amount = amount, dateMillis = System.currentTimeMillis(), notes = notes)
+                Payment(
+                    groupId = groupId,
+                    memberId = memberId,
+                    amount = amount,
+                    dateMillis = System.currentTimeMillis(),
+                    notes = notes + if (isDeduction) " (Minus Bulk Cost applied)" else ""
+                )
             )
+
+            if (isDeduction) {
+                 repository.insertBulkExpense(
+                     BulkExpense(
+                         groupId = groupId,
+                         title = "Guest reduction ($memberName)",
+                         amount = -amount,
+                         paidByMemberId = memberId,
+                         dateMillis = System.currentTimeMillis(),
+                         notes = "Minus Bulk reduction funded by guest contribution"
+                     )
+                 )
+            } else if (amount > currentOwed) {
+                val overpaidExcess = amount - currentOwed.coerceAtLeast(0.0)
+                if (overpaidExcess > 0.0) {
+                    repository.insertBankTransaction(
+                        BankTransaction(
+                            groupId = groupId,
+                            dateMillis = System.currentTimeMillis(),
+                            description = "Overpayment by $memberName",
+                            amount = overpaidExcess,
+                            memberId = memberId,
+                            isSystemOverpayment = true
+                        )
+                    )
+                }
+            }
         }
     }
 
     fun deletePayment(payment: Payment) {
         viewModelScope.launch {
             repository.deletePayment(payment)
+            // Reverse latest system overpayment if one exists around the same time
+            val groupTransactions = repository.getBankTransactionsForGroup(payment.groupId).firstOrNull() ?: emptyList()
+            val matched = groupTransactions.find {
+                it.isSystemOverpayment && it.memberId == payment.memberId && Math.abs(it.dateMillis - System.currentTimeMillis()) < 60000L
+            } ?: groupTransactions.find {
+                it.isSystemOverpayment && it.memberId == payment.memberId
+            }
+            if (matched != null) {
+                repository.deleteBankTransaction(matched)
+            }
+        }
+    }
+
+    fun addBulkExpense(title: String, amount: Double, paidByMemberId: Int, isPaidFromBank: Boolean = false) {
+        val groupId = _selectedGroupId.value ?: return
+        viewModelScope.launch {
+            repository.insertBulkExpense(
+                BulkExpense(
+                    groupId = groupId,
+                    title = title,
+                    amount = amount,
+                    paidByMemberId = paidByMemberId,
+                    dateMillis = System.currentTimeMillis(),
+                    isPaidFromBank = isPaidFromBank
+                )
+            )
+            if (isPaidFromBank && amount > 0.0) {
+                repository.insertBankTransaction(
+                    BankTransaction(
+                        groupId = groupId,
+                        dateMillis = System.currentTimeMillis(),
+                        description = "Bulk Expense: $title",
+                        amount = -amount
+                    )
+                )
+            }
+        }
+    }
+
+    fun deleteBulkExpense(bulkExpense: BulkExpense) {
+        viewModelScope.launch {
+            repository.deleteBulkExpense(bulkExpense)
+            if (bulkExpense.isPaidFromBank) {
+                val groupTransactions = repository.getBankTransactionsForGroup(bulkExpense.groupId).firstOrNull() ?: emptyList()
+                val targetStr = "Bulk Expense: ${bulkExpense.title}"
+                val matched = groupTransactions.find {
+                    it.amount < 0.0 && (it.description == targetStr || Math.abs(it.amount - (-bulkExpense.amount)) < 0.01)
+                }
+                if (matched != null) {
+                    repository.deleteBankTransaction(matched)
+                }
+            }
+        }
+    }
+
+    fun addManualBankTransaction(description: String, amount: Double) {
+        val groupId = _selectedGroupId.value ?: return
+        viewModelScope.launch {
+            repository.insertBankTransaction(
+                BankTransaction(
+                    groupId = groupId,
+                    dateMillis = System.currentTimeMillis(),
+                    description = description,
+                    amount = amount
+                )
+            )
+        }
+    }
+
+    fun updateBulkExpense(bulkExpense: BulkExpense) {
+        viewModelScope.launch {
+            repository.insertBulkExpense(bulkExpense)
         }
     }
 
@@ -377,5 +608,317 @@ class CourtLedgerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun clearEmailLogs() {
         _emailLogs.value = emptyList()
+    }
+
+    private fun escapeCsv(value: String): String {
+        return "\"" + value.replace("\"", "\"\"") + "\""
+    }
+
+    private fun parseCsvLine(line: String): List<String> {
+        val result = mutableListOf<String>()
+        var current = java.lang.StringBuilder()
+        var inQuotes = false
+        var i = 0
+        while (i < line.length) {
+            val c = line[i]
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length && line[i + 1] == '"') {
+                    current.append('"')
+                    i++
+                } else {
+                    inQuotes = !inQuotes
+                }
+            } else if (c == ',' && !inQuotes) {
+                result.add(current.toString().trim())
+                current = java.lang.StringBuilder()
+            } else {
+                current.append(c)
+            }
+            i++
+        }
+        result.add(current.toString().trim())
+        return result
+    }
+
+    suspend fun exportAllToCsvString(): String {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val sb = java.lang.StringBuilder()
+            sb.appendLine("# CourtLedger Full Backup CSV (Universally compatible format)")
+            sb.appendLine("# Generated on: " + java.util.Date().toString())
+            sb.appendLine("# Format: Prefix,Fields...")
+
+            // Groups
+            val groups = database.groupDao().getAllGroupsSync()
+            groups.forEach { g ->
+                sb.appendLine("G,${g.id},${escapeCsv(g.name)},${escapeCsv(g.sportType)},${escapeCsv(g.currency)},${escapeCsv(g.themeColor)}")
+            }
+
+            // Members
+            val members = database.memberDao().getAllMembers()
+            members.forEach { m ->
+                sb.appendLine("M,${m.id},${m.groupId},${escapeCsv(m.name)},${escapeCsv(m.role)},${escapeCsv(m.email)},${m.isCurrentUser}")
+            }
+
+            // Sessions
+            val sessions = database.sessionDao().getAllSessions()
+            sessions.forEach { s ->
+                sb.appendLine("S,${s.id},${s.groupId},${s.dateMillis},${escapeCsv(s.notes)},${s.totalCost}")
+            }
+
+            // ExpenseItems
+            val expenses = database.expenseItemDao().getAllExpenseItems()
+            expenses.forEach { e ->
+                sb.appendLine("E,${e.id},${e.sessionId},${escapeCsv(e.name)},${e.amount}")
+            }
+
+            // Attendance
+            val attendances = database.attendanceDao().getAllAttendance()
+            attendances.forEach { a ->
+                sb.appendLine("A,${a.id},${a.sessionId},${a.memberId},${a.isPresent},${a.costOverride ?: ""}")
+            }
+
+            // Payments
+            val payments = database.paymentDao().getAllPayments()
+            payments.forEach { p ->
+                sb.appendLine("P,${p.id},${p.groupId},${p.memberId},${p.amount},${p.dateMillis},${escapeCsv(p.notes)}")
+            }
+
+            // BulkExpenses
+            val bulkExpenses = database.bulkExpenseDao().getAllBulkExpenses()
+            bulkExpenses.forEach { b ->
+                sb.appendLine("B,${b.id},${b.groupId},${escapeCsv(b.title)},${b.amount},${b.paidByMemberId},${b.dateMillis},${escapeCsv(b.notes)}")
+            }
+
+            // BankTransactions
+            val bankTransactions = database.bankTransactionDao().getAllBankTransactions()
+            bankTransactions.forEach { bt ->
+                sb.appendLine("BT,${bt.id},${bt.groupId},${bt.dateMillis},${escapeCsv(bt.description)},${bt.amount},${bt.memberId ?: ""},${bt.isSystemOverpayment}")
+            }
+
+            sb.toString()
+        }
+    }
+
+    suspend fun importAllFromCsvString(csvContent: String): Boolean {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val lines = csvContent.lineSequence()
+
+                val groupsToInsert = mutableListOf<Group>()
+                val membersToInsert = mutableListOf<Member>()
+                val sessionsToInsert = mutableListOf<Session>()
+                val expensesToInsert = mutableListOf<ExpenseItem>()
+                val attendancesToInsert = mutableListOf<Attendance>()
+                val paymentsToInsert = mutableListOf<Payment>()
+                val bulkExpensesToInsert = mutableListOf<BulkExpense>()
+                val bankTransactionsToInsert = mutableListOf<BankTransaction>()
+
+                for (line in lines) {
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+                    val parts = parseCsvLine(trimmed)
+                    if (parts.isEmpty()) continue
+
+                    val prefix = parts[0]
+                    when (prefix) {
+                        "G" -> {
+                            if (parts.size >= 6) {
+                                groupsToInsert.add(
+                                    Group(
+                                        id = parts[1].toInt(),
+                                        name = parts[2],
+                                        sportType = parts[3],
+                                        currency = parts[4],
+                                        themeColor = parts[5]
+                                    )
+                                )
+                            }
+                        }
+                        "M" -> {
+                            if (parts.size >= 7) {
+                                membersToInsert.add(
+                                    Member(
+                                        id = parts[1].toInt(),
+                                        groupId = parts[2].toInt(),
+                                        name = parts[3],
+                                        role = parts[4],
+                                        email = parts[5],
+                                        isCurrentUser = parts[6].toBoolean()
+                                    )
+                                )
+                            }
+                        }
+                        "S" -> {
+                            if (parts.size >= 6) {
+                                sessionsToInsert.add(
+                                    Session(
+                                        id = parts[1].toInt(),
+                                        groupId = parts[2].toInt(),
+                                        dateMillis = parts[3].toLong(),
+                                        notes = parts[4],
+                                        totalCost = parts[5].toDouble()
+                                    )
+                                )
+                            }
+                        }
+                        "E" -> {
+                            if (parts.size >= 5) {
+                                expensesToInsert.add(
+                                    ExpenseItem(
+                                        id = parts[1].toInt(),
+                                        sessionId = parts[2].toInt(),
+                                        name = parts[3],
+                                        amount = parts[4].toDouble()
+                                    )
+                                )
+                            }
+                        }
+                        "A" -> {
+                            if (parts.size >= 5) {
+                                val costOverrideStr = parts.getOrNull(5)
+                                val costOverride = if (costOverrideStr.isNullOrEmpty()) null else costOverrideStr.toDoubleOrNull()
+                                attendancesToInsert.add(
+                                    Attendance(
+                                        id = parts[1].toInt(),
+                                        sessionId = parts[2].toInt(),
+                                        memberId = parts[3].toInt(),
+                                        isPresent = parts[4].toBoolean(),
+                                        costOverride = costOverride
+                                    )
+                                )
+                            }
+                        }
+                        "P" -> {
+                            if (parts.size >= 7) {
+                                paymentsToInsert.add(
+                                    Payment(
+                                        id = parts[1].toInt(),
+                                        groupId = parts[2].toInt(),
+                                        memberId = parts[3].toInt(),
+                                        amount = parts[4].toDouble(),
+                                        dateMillis = parts[5].toLong(),
+                                        notes = parts[6]
+                                    )
+                                )
+                            }
+                        }
+                        "B" -> {
+                            if (parts.size >= 8) {
+                                bulkExpensesToInsert.add(
+                                    BulkExpense(
+                                        id = parts[1].toInt(),
+                                        groupId = parts[2].toInt(),
+                                        title = parts[3],
+                                        amount = parts[4].toDouble(),
+                                        paidByMemberId = parts[5].toInt(),
+                                        dateMillis = parts[6].toLong(),
+                                        notes = parts[7]
+                                    )
+                                )
+                            }
+                        }
+                        "BT" -> {
+                            if (parts.size >= 6) {
+                                val memIdStr = parts.getOrNull(6) ?: ""
+                                val memId = if (memIdStr.isEmpty()) null else memIdStr.toIntOrNull()
+                                val isOver = parts.getOrNull(7)?.toBoolean() ?: false
+                                bankTransactionsToInsert.add(
+                                    BankTransaction(
+                                        id = parts[1].toInt(),
+                                        groupId = parts[2].toInt(),
+                                        dateMillis = parts[3].toLong(),
+                                        description = parts[4],
+                                        amount = parts[5].toDouble(),
+                                        memberId = memId,
+                                        isSystemOverpayment = isOver
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                database.withTransaction {
+                    // We must delete from children/foreign key constrained tables first to avoid SQLite constraints!
+                    database.expenseItemDao().deleteAllExpenseItems()
+                    database.attendanceDao().deleteAllAttendance()
+                    database.paymentDao().deleteAllPayments()
+                    database.bulkExpenseDao().deleteAllBulkExpenses()
+                    database.bankTransactionDao().deleteAllBankTransactions()
+                    database.sessionDao().deleteAllSessions()
+                    database.memberDao().deleteAllMembers()
+                    database.groupDao().deleteAllGroups()
+
+                    // Insert parent records first, then child records!
+                    database.groupDao().insertAll(groupsToInsert)
+                    database.memberDao().insertAll(membersToInsert)
+                    database.sessionDao().insertAll(sessionsToInsert)
+                    database.expenseItemDao().insertAll(expensesToInsert)
+                    database.attendanceDao().insertAll(attendancesToInsert)
+                    database.paymentDao().insertAll(paymentsToInsert)
+                    database.bulkExpenseDao().insertAll(bulkExpensesToInsert)
+                    database.bankTransactionDao().insertAll(bankTransactionsToInsert)
+                }
+
+                val firstGroup = groupsToInsert.firstOrNull()
+                if (firstGroup != null) {
+                    _selectedGroupId.value = firstGroup.id
+                } else {
+                    _selectedGroupId.value = null
+                }
+
+                true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            }
+        }
+    }
+
+    suspend fun deleteGroupCascaded(groupId: Int): Boolean {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                database.withTransaction {
+                    // 1. Find sessions for group
+                    val sessions = database.sessionDao().getAllSessions().filter { it.groupId == groupId }
+                    sessions.forEach { session ->
+                        // 2. Delete attendance for each session
+                        database.attendanceDao().deleteAttendanceForSession(session.id)
+                        // 3. Delete expense items for each session
+                        database.expenseItemDao().deleteExpensesForSession(session.id)
+                        // 4. Delete the session
+                        database.sessionDao().delete(session)
+                    }
+
+                    // 5. Delete bulk expenses for group
+                    val bulkExpenses = database.bulkExpenseDao().getAllBulkExpenses().filter { it.groupId == groupId }
+                    bulkExpenses.forEach { database.bulkExpenseDao().delete(it) }
+
+                    // 6. Delete payments for group
+                    val payments = database.paymentDao().getAllPayments().filter { it.groupId == groupId }
+                    payments.forEach { database.paymentDao().delete(it) }
+
+                    // 7. Delete members for group
+                    val members = database.memberDao().getAllMembers().filter { it.groupId == groupId }
+                    members.forEach { database.memberDao().delete(it) }
+
+                    // 8. Delete group itself
+                    val group = database.groupDao().getGroupById(groupId)
+                    if (group != null) {
+                        database.groupDao().delete(group)
+                    }
+                }
+
+                // Pick another group if available
+                val allGroups = database.groupDao().getAllGroupsSync()
+                val nextGroup = allGroups.firstOrNull()
+                _selectedGroupId.value = nextGroup?.id
+
+                true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            }
+        }
     }
 }

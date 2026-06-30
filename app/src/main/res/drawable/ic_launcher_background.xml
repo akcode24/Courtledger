@@ -14,8 +14,8 @@
                 android:endX="108"
                 android:endY="108"
                 android:type="linear">
-                <item android:offset="0.0" android:color="#004D40"/> <!-- Dark Green Teal -->
-                <item android:offset="1.0" android:color="#00251A"/> <!-- Deep Forest Green Teal -->
+                <item android:offset="0.0" android:color="#E6F7FF"/> <!-- Light Sky Blue -->
+                <item android:offset="1.0" android:color="#BAE7FF"/> <!-- Soft Cyan Blue -->
             </gradient>
         </aapt:attr>
     </path>
